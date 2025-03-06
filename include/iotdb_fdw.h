@@ -1,11 +1,9 @@
-#include "fmgr.h"
 #include "postgres.h"
+#include "fmgr.h"
 
-#include "nodes/pg_list.h"
-
-#include "nodes/bitmapset.h" 
-#include "nodes//nodes.h"
 #include "nodes/pathnodes.h"
+#include "nodes/bitmapset.h" 
+#include "nodes/nodes.h"
 #include "nodes/plannodes.h"
 #include "nodes/execnodes.h"
 
@@ -15,7 +13,6 @@
 
 #include "stdbool.h"
 
-//#include "fmgr.h"
 
 #define CODE_VERSION 10000
 typedef struct IotDBFdwRelationInfo
@@ -124,6 +121,9 @@ typedef struct iotdb_opt
 
 PG_MODULE_MAGIC;
 
+#define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+
+
 extern Datum iotdb_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum iotdb_fdw_validator(PG_FUNCTION_ARGS);
 
@@ -158,3 +158,11 @@ PG_FUNCTION_INFO_V1(iotdb_fdw_version);
  iotdb_opt *iotdb_get_options(Oid foreignoid, Oid userid);
 
  Datum iotdb_fdw_version(PG_FUNCTION_ARGS);
+
+/// get cost and size estimates for a foreign scan on given foreign relation 
+void estimate_path_cost_size(PlannerInfo *root,
+							RelOptInfo *foreignrel,
+							List	*param_join_conds,
+							List	*pathkeys,
+							double *p_rows, int *p_width,
+							Cost *p_startup_cos, Cost *p_total_cost);

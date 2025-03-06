@@ -1,21 +1,20 @@
 //#include "fmgr.h"
-#include "postgres.h"
+
+//#include "postgres.h"
 #include "include/iotdb_fdw.h"
 
 #include "c.h"
+
 #include "common/fe_memutils.h"
+
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
+
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
-
-
-#include "nodes/pg_list.h"
-
+#include "optimizer/pathnode.h"
 
 #include "foreign/fdwapi.h"
-#include "foreign/foreign.h"
-
 
 #include "commands/defrem.h"
 
@@ -112,6 +111,7 @@ Datum iotdb_fdw_handler(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(fdwroutine);
 }
 
+// create fdwplan for a scan on foreign table
 void iotdbGetForeignRelSize(PlannerInfo *root,
                                    RelOptInfo *baserel, 
                                    Oid foreigntableid)
@@ -165,9 +165,9 @@ void iotdbGetForeignRelSize(PlannerInfo *root,
         
 		/* Fill in basically-bogus cost estimates for use later. */
         ///@todo:  realize this function
-		/*estimate_path_cost_size(root, baserel, NIL, NIL,
+		estimate_path_cost_size(root, baserel, NIL, NIL,
             &fpinfo->rows, &fpinfo->width,
-            &fpinfo->startup_cost, &fpinfo->total_cost);*/    
+            &fpinfo->startup_cost, &fpinfo->total_cost);
     }
     
     fpinfo->relation_name = psprintf("%u", baserel->relid);
@@ -177,10 +177,114 @@ Datum iotdb_fdw_version(PG_FUNCTION_ARGS)
 {
     PG_RETURN_INT32(CODE_VERSION);  
 }
-/// @todo functions below are unimplemented
+
+// estimate path cost and size for a scan on foreign table
+void estimate_path_cost_size(PlannerInfo *root, 
+                            RelOptInfo *foreignrel, 
+                            List *param_join_conds, 
+                            List *pathkeys, 
+                            double *p_rows, int *p_width, 
+                            Cost *p_startup_cos, Cost *p_total_cost)
+{
+    IotDBFdwRelationInfo *fpinfo = (IotDBFdwRelationInfo *)foreignrel->fdw_private;
+    double rows;
+    double retrieved_rows;
+    int width;
+    Cost startup_cost;
+    Cost total_cost;
+    Cost cpu_per_tuple;
+
+    if(fpinfo->use_remote_estimate)
+    {
+        ereport(ERROR,
+                errmsg("remote estimate is not supported yet"));
+    }
+    else 
+    {
+        Cost run_cost = 0;
+
+        // don't support join conditions
+        Assert(param_join_conds == NIL); 
+
+
+        rows = foreignrel->rows;
+        width = foreignrel->reltarget->width;
+
+        // back into an estimate of the number of retrieved rows
+        retrieved_rows = clamp_row_est(rows / fpinfo->local_conds_sel);
+
+        if( fpinfo->rel_startup_cost > 0 && fpinfo->rel_total_cost > 0 )
+        {
+            startup_cost = fpinfo->rel_startup_cost;
+            run_cost = fpinfo->rel_total_cost;
+        }
+        else
+        {
+            Assert(foreignrel->reloptkind != RELOPT_BASEREL);
+            retrieved_rows = Min(retrieved_rows, foreignrel->tuples);
+
+            startup_cost = 0;
+            run_cost = 0;
+            run_cost += seq_page_cost * foreignrel->pages;
+
+            startup_cost += foreignrel->baserestrictcost.startup;
+            cpu_per_tuple = cpu_tuple_cost + foreignrel->baserestrictcost.per_tuple;
+            run_cost += cpu_per_tuple * foreignrel->tuples;
+        }
+
+        if(pathkeys != NIL)
+        {
+            startup_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+            run_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
+        }
+        total_cost = startup_cost + run_cost; // calculating total cost
+
+        if( pathkeys == NIL && param_join_conds == NIL )
+        {
+            fpinfo->rel_startup_cost = startup_cost;
+            fpinfo->rel_total_cost = total_cost;
+        }
+
+        /*
+        take additional costs for transferring data from the foreign server,
+        including the cost of CPU to process the data and the cost of network
+        (fdw_startup_cost):transferring data across the network
+        (fdw_tuple_cost per retireved row): local manipulation of data
+        (cpu_tuple_cost per retrieved row)
+        */
+        startup_cost += fpinfo->fdw_startup_cost;
+        total_cost += fpinfo->fdw_startup_cost;
+        total_cost += fpinfo->fdw_tuple_cost * retrieved_rows;
+        total_cost += cpu_tuple_cost * retrieved_rows;
+
+        *p_rows = rows;
+        *p_width = width;
+        *p_startup_cos = startup_cost;
+        *p_total_cost = total_cost;
+    }
+}
+// create foreign path for a scan on foreign table
 void iotdbGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
-    return ;
+    Cost startup_cost = 10;
+    Cost total_cost = baserel->rows + startup_cost;
+
+    //estimate costs
+    total_cost = baserel->rows; 
+
+    // create foreignpath node and add it as only possible path
+    add_path(baserel, (Path *)create_foreignscan_path( root, 
+                                                        baserel, 
+                                                        NULL,  // defalut pathtarget
+                                                        baserel->rows, 
+                                                        startup_cost, 
+                                                        total_cost,
+                                                        NIL,  // no pathkeys
+                                                        baserel->lateral_relids, 
+                                                        NULL,    // no extra plan
+                                                        NIL,  // no fdw_restrictinfo list
+                                                        NIL));  // no fdw_private data
+    
 }
 
 ForeignScan *iotdbGetForeignPlan(PlannerInfo *root,
