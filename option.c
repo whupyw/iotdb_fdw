@@ -1,8 +1,10 @@
+#include "include/iotdb_fdw.h"
 #include <regex.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include "include/option.h"
+
 
 #include "access/reloptions.h"
 
@@ -116,3 +118,54 @@ bool starts_with_http_or_https(const char *str)
         return true;
     return false;
 }
+
+iotdb_opt *iotdb_get_options(Oid foreignoid, Oid userid) {
+    ForeignTable *f_table = NULL;
+    ForeignServer *f_server = NULL;
+    UserMapping *f_mapping;
+    List *options;
+    ListCell *lc;
+    iotdb_opt *opt;
+  
+    opt = (iotdb_opt *)palloc(sizeof(iotdb_opt));
+    memset(opt, 0, sizeof(iotdb_opt));
+  
+    PG_TRY();
+    {
+      f_table = GetForeignTable(foreignoid);
+      f_server = GetForeignServer(f_table->serverid);
+    }
+    PG_CATCH();
+    {
+      f_table = NULL;
+      f_server = GetForeignServer(foreignoid);
+    }
+    PG_END_TRY();
+  
+    f_mapping = GetUserMapping(userid, f_server->serverid);
+  
+    options = NIL;
+    if (f_table)
+      options = list_concat(options, f_table->options);
+    options = list_concat(options, f_server->options);
+    options = list_concat(options, f_mapping->options);
+  
+    foreach (lc, options) {
+      DefElem *def = (DefElem *)lfirst(lc);
+  
+      if (strcmp(def->defname, "table") == 0)
+        opt->svr_table = defGetString(def);
+      else if (strcmp(def->defname, "host") == 0)
+        opt->svr_address = defGetString(def);
+      else if (strcmp(def->defname, "port") == 0)
+        opt->svr_port = atoi(defGetString(def));
+      else if (strcmp(def->defname, "user") == 0)
+        opt->svr_username = defGetString(def);
+      else if (strcmp(def->defname, "password") == 0)
+        opt->svr_password = defGetString(def);
+      else if (strcmp(def->defname, "dbname") == 0)
+        opt->svr_database = defGetString(def);
+    }
+  
+    return opt;
+  }
