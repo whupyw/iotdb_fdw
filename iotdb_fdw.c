@@ -7,14 +7,22 @@
 
 #include "common/fe_memutils.h"
 
+#include "executor/executor.h"
+#include "fmgr.h"
+#include "foreign/foreign.h"
 #include "lib/stringinfo.h"
+
+#include "nodes/bitmapset.h"
 #include "nodes/execnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
-
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
 #include "nodes/value.h"
+#include "nodes/nodeFuncs.h"
+
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -22,14 +30,17 @@
 #include "foreign/fdwapi.h"
 
 #include "commands/defrem.h"
+#include "parser/parsetree.h"
 
 #include "miscadmin.h"
 #include "optimizer/planmain.h"
+#include "postgres_ext.h"
 #include "utils/elog.h"
 #include <string.h>
 
 #include "utils/float.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 
 static void iotdbGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                    Oid foreigntableid);
@@ -60,6 +71,23 @@ static void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *foreignrel,
 static void iotdb_extract_slcols(IotDBFdwRelationInfo *fpinfo,
                                  PlannerInfo *root, RelOptInfo *baserel,
                                  List *tlist);
+
+/*
+ * Prepare for processing of parameters used in remote query.
+ */
+static void prepare_query_params(PlanState *node, List *fdw_exprs,
+                                 List *remote_exprs, Oid foreigntableid,
+                                 int numParams, FmgrInfo **param_flinfo,
+                                 List **param_exprs, const char ***param_values,
+                                 Oid **param_types,
+                                 IotDBType **param_influxdb_types,
+                                 IotDBValue **param_influxdb_values,
+                                 IotDBColumnInfo **param_column_info);
+
+/*
+ * Check if parameter is in the condition
+ */
+static bool iotdb_param_belong_to_qual(Node *qual, Node *param);
 
 Datum iotdb_fdw_version(PG_FUNCTION_ARGS);
 /*
@@ -180,7 +208,7 @@ static void estimate_path_cost_size(PlannerInfo *root, RelOptInfo *foreignrel,
       startup_cost = fpinfo->rel_startup_cost;
       run_cost = fpinfo->rel_total_cost;
     } else {
-      Assert(foreignrel->reloptkind != RELOPT_JOINREL);   // not RELOPT_JOINREL
+      Assert(foreignrel->reloptkind != RELOPT_JOINREL); // not RELOPT_JOINREL
       retrieved_rows = Min(retrieved_rows, foreignrel->tuples);
 
       startup_cost = 0;
@@ -324,7 +352,7 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   fpinfo->final_remote_exprs = remote_exprs;
 
   ///@todo for update
-    for_update = 0;
+  for_update = 0;
   /* Get remote condition */
   if (baserel->reloptkind == RELOPT_UPPER_REL) {
     IotDBFdwRelationInfo *ofpinfo;
@@ -334,7 +362,7 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   } else {
     remote_conds = remote_exprs;
   }
-  
+
   fdw_private = list_make3(makeString(sql.data), retrieved_attrs,
                            makeInteger(for_update));
   fdw_private = lappend(fdw_private, fdw_scan_tlist);
@@ -348,9 +376,60 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                           outer_plan);
 }
 
+/// Initialize access to database
 static void iotdbBeginForeignScan(ForeignScanState *node, int eflags) {
-  
-  return;
+  IotDBFdwExecState *festate = NULL;
+  EState *estate = node->ss.ps.state;
+  ForeignScan *fscan = (ForeignScan *)node->ss.ps.plan;
+  RangeTblEntry *rte;
+  int num_params;
+  int rtindex;
+  [[maybe_unused]]bool schemaless = false; // not support schemaless now
+  Oid userid;
+  [[maybe_unused]]ForeignTable *table;
+  List *remote_exprs;
+  ForeignTable *ftable;
+
+  festate = (IotDBFdwExecState *)palloc0(sizeof(IotDBFdwExecState));
+  node->fdw_state = (void *)festate;
+
+  // save private state in node->fdw_state
+  festate->rowidx = 0;
+  node->fdw_state = (void *)festate;
+  festate->rowidx = 0;
+
+  // stash away the state info we have already
+  festate->query = strVal(list_nth(fscan->fdw_private, 0));
+  festate->retrieved_Attrs = list_nth(fscan->fdw_private, 1);
+  // festate->for_update = intVal(list_nth(fscan->fdw_private, 2));
+  festate->tlist = (List *)list_nth(fscan->fdw_private, 3);
+  // festate->is_tlist_func_pushdown = intVal(list_nth(fscan->fdw_private, 4));
+  remote_exprs = (List *)list_nth(fscan->fdw_private, 4);
+
+  festate->cursor_exits = false;
+
+  if (fscan->scan.scanrelid > 0)
+    rtindex = fscan->scan.scanrelid;
+
+  rtindex = bms_next_member(fscan->fs_base_relids, -1);
+  rte = exec_rt_fetch(rtindex, estate);
+  userid = OidIsValid(fscan->checkAsUser) ? fscan->checkAsUser : GetUserId();
+
+  // get options
+  festate->iotdbFdwOptions = iotdb_get_options(rte->relid, userid);
+
+  ftable = GetForeignTable(rte->relid);
+  festate->user = GetUserMapping(userid, ftable->serverid);
+
+  num_params = list_length(fscan->fdw_exprs);
+  festate->numParams = num_params;
+  if (num_params > 0)
+    prepare_query_params((PlanState *)node, fscan->fdw_exprs, remote_exprs,
+                         rte->relid, num_params, &festate->param_finfo,
+                         &festate->param_exprs, &festate->param_values,
+                         &festate->param_types, &festate->param_iotdb_types,
+                         &festate->param_iotdb_values,
+                         &festate->param_column_info);
 }
 
 static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
@@ -404,3 +483,84 @@ int iotdb_set_transmission_modes(void) {
 void iotdb_reset_transmisson_modes(int nestlevel) {
   AtEOXact_GUC(true, nestlevel);
 }
+
+static void // params are used in remote query
+prepare_query_params(PlanState *node, List *fdw_exprs, List *remote_exprs,
+                     Oid foreigntableid, int numParams, FmgrInfo **param_flinfo,
+                     List **param_exprs, const char ***param_values,
+                     Oid **param_types, IotDBType **param_iotdb_types,
+                     IotDBValue **param_iotdb_values,
+                     IotDBColumnInfo **param_column_info) {
+  int i;
+  ListCell *lc;
+
+  Assert(numParams > 0);
+
+  *param_flinfo = (FmgrInfo *)palloc0(sizeof(FmgrInfo) * numParams);
+  *param_types = (Oid *)palloc0(sizeof(Oid) * numParams);
+  *param_iotdb_types = (IotDBType *)palloc0(sizeof(IotDBType) * numParams);
+  *param_iotdb_values = (IotDBValue *)palloc0(sizeof(IotDBValue) * numParams);
+  *param_column_info =
+      (IotDBColumnInfo *)palloc0(sizeof(IotDBColumnInfo) * numParams);
+
+  i = 0;
+  foreach (lc, fdw_exprs) {
+    Node *param_expr = (Node *)lfirst(lc);
+    Oid typefnoid;
+    bool isvarlena;
+
+    (*param_types)[i] = exprType(param_expr);
+    getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
+    fmgr_info(typefnoid, &(*param_flinfo)[i]);
+
+    // columns : TIME || TAGS || FIELD
+    if (IOTDB_IS_TIME_TYPE((*param_types)[i])) {
+      ListCell *expr_cell;
+
+      foreach (expr_cell, remote_exprs) {
+        Node *qual = (Node *)lfirst(expr_cell);
+
+        if (iotdb_param_belong_to_qual(qual, param_expr)) {
+          Var *col;
+          char *colname;
+          List *column_list = pull_var_clause(qual, PVC_RECURSE_PLACEHOLDERS);
+
+          /*
+           * Cases for time comparison with Parameter InfluxDB FDW supports
+           * pushdown. (1) time type column (both time key and tags/fields) =
+           * Param (2) time key column > Param (3) time key column < Param (4)
+           * time key column >= Param (5) time key column <= Param
+           *
+           * In each case, there is only one time column, so column_list has one
+           * item.
+           */
+          col = linitial(column_list);
+
+          colname = iotdb_get_column_name(foreigntableid, col->varattno);
+
+          if (IOTDB_IS_TIME_COLUMN(colname))
+            (*param_column_info)[i].column_type = IOTDB_TIME_KEY;
+          else if (iotdb_is_tag_key(colname, foreigntableid))
+            (*param_column_info)[i].column_type = IOTDB_TAG_KEY;
+          else
+            (*param_column_info)[i].column_type = IOTDB_FIELD_KEY;
+        }
+      }
+    }
+    i++;
+  }
+}
+
+/*
+ * Check if parameter is in the condition
+ */
+ static bool iotdb_param_belong_to_qual(Node *qual, Node *param)
+ {
+   if (qual == NULL)
+     return false;
+ 
+   if (equal(qual, param))
+     return true;
+ 
+   return expression_tree_walker(qual, iotdb_param_belong_to_qual, param);
+ }

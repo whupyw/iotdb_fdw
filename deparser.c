@@ -480,6 +480,7 @@ void iotdb_deparse_from_expr(List *quals, deparse_expr_cxt *context) {
   }
 }
 
+// WHERE
 void iotdb_append_conditions(List *exprs, deparse_expr_cxt *context) {
   int nestlevel;
   ListCell *lc;

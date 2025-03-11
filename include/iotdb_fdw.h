@@ -170,7 +170,7 @@ typedef struct IotDBFdwExecState
 	FmgrInfo	*param_finfo;//output convension functions for them
 	List 		*param_exprs;//executable expressions for param values
 	const char	**param_values;//textual  values of query parameters
-	Oid			param_types;	//type of query parameters
+	Oid			*param_types;	//type of query parameters
 	IotDBType	*param_iotdb_types; //IotDB type of query parameter
 	IotDBValue	*param_iotdb_values; // IotDB values 
 	IotDBColumnInfo	*param_column_info; //information of columns
