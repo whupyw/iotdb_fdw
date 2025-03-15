@@ -20,6 +20,7 @@ struct IotDBFdwOption iotdb_valid_options[] =
     [3] = {"user",UserMappingRelationId},
     [4] = {"password",UserMappingRelationId},
     [5] = {"table",ForeignTableRelationId}
+
 };
 
 PG_FUNCTION_INFO_V1(iotdb_fdw_validator);

@@ -2,7 +2,11 @@
 
 // #include "postgres.h"
 #include "include/iotdb_fdw.h"
+#include "executor/tuptable.h"
 
+#ifndef QUERY_REST
+#include "include/query_rest.h"
+#endif
 #include "c.h"
 
 #include "common/fe_memutils.h"
@@ -19,9 +23,9 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "nodes/value.h"
-#include "nodes/nodeFuncs.h"
 
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -41,6 +45,7 @@
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/palloc.h"
 
 static void iotdbGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                    Oid foreigntableid);
@@ -84,10 +89,18 @@ static void prepare_query_params(PlanState *node, List *fdw_exprs,
                                  IotDBValue **param_influxdb_values,
                                  IotDBColumnInfo **param_column_info);
 
+static void create_cursor(ForeignScanState *node);
 /*
  * Check if parameter is in the condition
  */
 static bool iotdb_param_belong_to_qual(Node *qual, Node *param);
+
+static void process_query_params(ExprContext *econtext, FmgrInfo *param_flinfo,
+                                 List *param_exprs, const char **param_values,
+                                 Oid *param_types,
+                                 IotDBType *param_influxdb_types,
+                                 IotDBValue *param_influxdb_values,
+                                 IotDBColumnInfo *param_column_info);
 
 Datum iotdb_fdw_version(PG_FUNCTION_ARGS);
 /*
@@ -384,9 +397,9 @@ static void iotdbBeginForeignScan(ForeignScanState *node, int eflags) {
   RangeTblEntry *rte;
   int num_params;
   int rtindex;
-  [[maybe_unused]]bool schemaless = false; // not support schemaless now
+  [[maybe_unused]] bool schemaless = false; // not support schemaless now
   Oid userid;
-  [[maybe_unused]]ForeignTable *table;
+  [[maybe_unused]] ForeignTable *table;
   List *remote_exprs;
   ForeignTable *ftable;
 
@@ -433,7 +446,107 @@ static void iotdbBeginForeignScan(ForeignScanState *node, int eflags) {
 }
 
 static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
-  return NULL;
+  IotDBFdwExecState *festate = (IotDBFdwExecState *)node->fdw_state;
+  TupleTableSlot *tupleSlot = node->ss.ss_ScanTupleSlot;
+  EState *estate = node->ss.ps.state;
+  TupleDesc tupleDescriptor = tupleSlot->tts_tupleDescriptor;
+  iotdb_opt *opt = festate->iotdbFdwOptions;
+  struct IotDBQuery_return volatile ret; // pack the query result
+  struct IotDBResult volatile *result;
+  ForeignScan *fscan = (ForeignScan *)node->ss.ps.plan;
+  [[maybe_unused]]RangeTblEntry *rte;
+  int32 rtindex;
+  [[maybe_unused]]bool is_aggregate;
+
+  /*
+   * Identify which user to do the remote access as.  This should match what
+   * ExecCheckRTEPerms() does.  In case of a join or aggregate, use the
+   * lowest-numbered member RTE as a representative; we would get the same
+   * result from any.
+   */
+  if (fscan->scan.scanrelid > 0) {
+    rtindex = fscan->scan.scanrelid;
+    is_aggregate = false;
+  } else {
+    rtindex = bms_next_member(fscan->fs_relids, -1);
+    is_aggregate = true;
+  }
+  rte = rt_fetch(rtindex, estate->es_range_table);
+
+  // get options
+  opt = festate->iotdbFdwOptions;
+
+  // if this is first call after Begin or Rescan, we need to create a new cursor
+  // on remote side
+  if (!festate->cursor_exits)
+    create_cursor(node);
+
+  memset(tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
+  memset(tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
+  ExecClearTuple(tupleSlot);
+
+  if (festate->rowidx == 0) {
+    MemoryContext oldcontext = NULL;
+
+    PG_TRY();
+    {
+      oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+      ret = IotDBQuery(festate->query, festate->user, opt,
+                       festate->param_iotdb_types, festate->param_iotdb_values,
+                       festate->numParams);
+
+      if (ret.r1 != NULL) // ERROR occured
+      {
+        char *err = pstrdup(ret.r1);
+        free(ret.r1);
+        ret.r1 = err;
+        ereport(ERROR, (errmsg("IotDBQuery failed: %s", ret.r1)));
+      }
+
+      result = ret.r0;
+      festate->temp_result = (void *)result;
+
+      festate->row_nums = result->nrow;
+      MemoryContextSwitchTo(oldcontext);
+      // IotDBFreeResult(result);
+    }
+    PG_CATCH();
+    {
+      if (ret.r1 == NULL) {
+        // IotDBFreeResult(result);
+        ereport(ERROR, (errmsg("IotDBQuery failed: unknown error")));
+      }
+
+      if (oldcontext)
+        MemoryContextSwitchTo(oldcontext);
+      PG_RE_THROW();
+    }
+    PG_END_TRY();
+  }
+
+  if (festate->rowidx < festate->row_nums) {
+    MemoryContext oldcontext = NULL;
+
+    result = (IotDBResult *)festate->temp_result;
+
+    // make_tuple_from_result_row(&(result->rows[festate->rowidx]),
+    //                            (IotDBResult *)result, tupleDescriptor,
+    //                            tupleSlot->tts_values, tupleSlot->tts_isnull,
+    //                            rte->relid, festate, is_aggregate);
+    
+    oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+    //freeIotDBResultRow(festate, festate->rowidx);
+
+    if(festate->rowidx == (festate->row_nums - 1))
+    {
+      //freeIotDBResult(festate);
+    }
+    MemoryContextSwitchTo(oldcontext);
+    ExecStoreVirtualTuple(tupleSlot);
+    festate->rowidx++;
+  }
+  return tupleSlot;
 }
 
 static void iotdbReScanForeignScan(ForeignScanState *node) { return; }
@@ -539,11 +652,11 @@ prepare_query_params(PlanState *node, List *fdw_exprs, List *remote_exprs,
           colname = iotdb_get_column_name(foreigntableid, col->varattno);
 
           if (IOTDB_IS_TIME_COLUMN(colname))
-            (*param_column_info)[i].column_type = IOTDB_TIME_KEY;
+            (*param_column_info)[i].col_type = IOTDB_TIME_KEY;
           else if (iotdb_is_tag_key(colname, foreigntableid))
-            (*param_column_info)[i].column_type = IOTDB_TAG_KEY;
+            (*param_column_info)[i].col_type = IOTDB_TAG_KEY;
           else
-            (*param_column_info)[i].column_type = IOTDB_FIELD_KEY;
+            (*param_column_info)[i].col_type = IOTDB_FIELD_KEY;
         }
       }
     }
@@ -554,13 +667,66 @@ prepare_query_params(PlanState *node, List *fdw_exprs, List *remote_exprs,
 /*
  * Check if parameter is in the condition
  */
- static bool iotdb_param_belong_to_qual(Node *qual, Node *param)
- {
-   if (qual == NULL)
-     return false;
- 
-   if (equal(qual, param))
-     return true;
- 
-   return expression_tree_walker(qual, iotdb_param_belong_to_qual, param);
- }
+static bool iotdb_param_belong_to_qual(Node *qual, Node *param) {
+  if (qual == NULL)
+    return false;
+
+  if (equal(qual, param))
+    return true;
+
+  return expression_tree_walker(qual, iotdb_param_belong_to_qual, param);
+}
+
+// create a cursor for node's query with current parameter values
+static void create_cursor(ForeignScanState *node) {
+  IotDBFdwExecState *festate = (IotDBFdwExecState *)node->fdw_state;
+  ExprContext *econtext = node->ss.ps.ps_ExprContext;
+  int numParams = festate->numParams;
+  const char **values = festate->param_values;
+
+  if (numParams > 0) {
+    MemoryContext oldcontxt;
+
+    oldcontxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+    festate->params = palloc(numParams);
+    process_query_params(
+        econtext, festate->param_finfo, festate->param_exprs, values,
+        festate->param_types, festate->param_iotdb_types,
+        festate->param_iotdb_values, festate->param_column_info);
+    MemoryContextSwitchTo(oldcontxt);
+  }
+}
+
+static void process_query_params(ExprContext *econtext, FmgrInfo *param_flinfo,
+                                 List *param_exprs, const char **param_values,
+                                 Oid *param_types, IotDBType *param_iotdb_types,
+                                 IotDBValue *param_iotdb_values,
+                                 IotDBColumnInfo *param_column_info) {
+  int nestlevel;
+  int i;
+  ListCell *lc;
+
+  nestlevel = iotdb_set_transmission_modes();
+
+  i = 0;
+  foreach (lc, param_exprs) {
+    ExprState *state = (ExprState *)lfirst(lc);
+    Datum expr_value;
+    bool isnull;
+
+    // evaluate the parameters' value
+    expr_value = ExecEvalExpr(state, econtext, &isnull);
+
+    // IoTDB support null
+    //  if(isnull)
+    //  {
+    //    ereport(ERROR, errmsg("iotdb_fdw:"));
+    //  }
+
+    // Bind parameters
+    iotdb_bind_sql_var(param_types[i], i, expr_value, param_column_info,
+                       param_iotdb_types, param_iotdb_values);
+    i++;
+  }
+  iotdb_reset_transmisson_modes(nestlevel);
+}

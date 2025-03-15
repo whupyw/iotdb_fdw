@@ -1,9 +1,0 @@
-iotdb_fdw.c: In function ‘iotdbGetForeignPlan’:
-iotdb_fdw.c:258:9: error: variable ‘scan_relid’ set but not used [-Werror=unused-but-set-variable]
-  258 |   Index scan_relid = baserel->relid;
-      |         ^~~~~~~~~~
-iotdb_fdw.c:329:1: error: control reaches end of non-void function [-Werror=return-type]
-  329 | }
-      | ^
-cc1: all warnings being treated as errors
-make: *** [Makefile:35: iotdb_fdw.o] Error 1

@@ -1,8 +1,11 @@
 
 #include "include/iotdb_fdw.h"
 #include "postgres.h"
-#include "fmgr.h"
+//#include "fmgr.h"
 #include "catalog/pg_operator.h"
+#include "datatype/timestamp.h"
+#include "foreign/foreign.h"
+
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
 #include "nodes/nodes.h"
@@ -10,9 +13,10 @@
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
-#include "postgres_ext.h"
-#include"parser/parser.h"
+#include "parser/parser.h"
 #include "parser/parsetree.h"
+#include "postgres.h"
+#include "postgres_ext.h"
 #include <string.h>
 #include <sys/types.h>
 
@@ -21,6 +25,7 @@
 #include "storage/lockdefs.h"
 
 #include "utils/elog.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -32,6 +37,8 @@
 #include "catalog/pg_type_d.h"
 
 #include "commands/defrem.h"
+#include "utils/timestamp.h"
+#include "varatt.h"
 
 PG_MODULE_MAGIC;
 #define QUOTE '"'
@@ -339,7 +346,7 @@ static void iotdb_deparse_target_list(StringInfo buf, PlannerInfo *root,
   }
 
   if (first) {
-    appendStringInfoString(buf, "*");
+    appendStringInfoString(buf, " * ");
     return;
   }
 
@@ -443,7 +450,7 @@ void iotdb_append_field_key(TupleDesc tupdesc, StringInfo buf, Index rtindex,
   RangeTblEntry *rte = NULL;
   for (i = 1; i <= tupdesc->natts; i++) {
     Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-     rte = planner_rt_fetch(rtindex, root);
+    rte = planner_rt_fetch(rtindex, root);
     char *name = iotdb_get_column_name(rte->relid, i);
 
     if (attr->attisdropped)
@@ -536,8 +543,8 @@ void iotdb_deparse_from_expr_for_rel(StringInfo buf, PlannerInfo *root,
 
 // Append remote name of specified foreign table to buf.
 void iotdb_deparse_relation(StringInfo buf, Relation rel) {
-  char *relname = RelationGetRelationName(rel);
-  appendStringInfo(buf, "%s", iotdb_quote_identifier(relname, QUOTE));
+  char *relname = iotdb_get_table_name(rel);
+  appendStringInfo(buf, "%s", relname);
 }
 
 void iotdb_deparse_expr(Expr *node, deparse_expr_cxt *context) {
@@ -741,43 +748,177 @@ void iotdb_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
 //   }
 // }
 
-bool iotdb_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr
-  *expr,
-                             bool for_tlist) {
-    foreign_glob_cxt glob_cxt;
-    foreign_loc_cxt loc_cxt;
-    IotDBFdwRelationInfo *fpinfo = (IotDBFdwRelationInfo
-    *)baserel->fdw_private;
-  
-    // check that the expression consists of nodes that are safe to execute
-  
-    glob_cxt.root = root;
-    glob_cxt.foreignrel = baserel;
+bool iotdb_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr,
+                           bool for_tlist) {
+  foreign_glob_cxt glob_cxt;
+  foreign_loc_cxt loc_cxt;
+  IotDBFdwRelationInfo *fpinfo = (IotDBFdwRelationInfo *)baserel->fdw_private;
+
+  // check that the expression consists of nodes that are safe to execute
+
+  glob_cxt.root = root;
+  glob_cxt.foreignrel = baserel;
+  glob_cxt.relids = baserel->relids;
+  glob_cxt.mixing_aggref_Status = IOTDB_TARGETS_MIXING_AGGREF_SAFE;
+  glob_cxt.for_tlist = for_tlist;
+  glob_cxt.is_inner_func = false;
+
+  /*
+   * For an upper relation, use relids from its underneath scan relation,
+   * because the upperrel's own relids currently aren't set to anything
+   * meaningful by the core code.  For other relation, use their own relids.
+   */
+
+  if (baserel->reloptkind == RELOPT_UPPER_REL)
+    glob_cxt.relids = fpinfo->outerrel->relids;
+  else
     glob_cxt.relids = baserel->relids;
-    glob_cxt.mixing_aggref_Status = IOTDB_TARGETS_MIXING_AGGREF_SAFE;
-    glob_cxt.for_tlist = for_tlist;
-    glob_cxt.is_inner_func = false;
-  
-    /*
-     * For an upper relation, use relids from its underneath scan relation,
-     * because the upperrel's own relids currently aren't set to anything
-     * meaningful by the core code.  For other relation, use their own relids.
-     */
-  
-    if (baserel->reloptkind == RELOPT_UPPER_REL)
-      glob_cxt.relids = fpinfo->outerrel->relids;
-    else
-      glob_cxt.relids = baserel->relids;
-  
-    loc_cxt.collation = InvalidOid;
-    loc_cxt.state = FDW_COLLATE_NONE;
-    loc_cxt.can_skip_cast = false;
-    loc_cxt.influx_fill_enable = false;
-    loc_cxt.has_time_key = false;
-    loc_cxt.has_sub_or_add_operator = false;
-    loc_cxt.is_comparison = false;
-  
-    if (!iotdb_foreign_expr_walker((Node *)expr, &glob_cxt, &loc_cxt))
-      return false;
-    return true;
+
+  loc_cxt.collation = InvalidOid;
+  loc_cxt.state = FDW_COLLATE_NONE;
+  loc_cxt.can_skip_cast = false;
+  loc_cxt.influx_fill_enable = false;
+  loc_cxt.has_time_key = false;
+  loc_cxt.has_sub_or_add_operator = false;
+  loc_cxt.is_comparison = false;
+
+  if (!iotdb_foreign_expr_walker((Node *)expr, &glob_cxt, &loc_cxt))
+    return false;
+  return true;
+}
+
+void iotdb_bind_sql_var(Oid type, int attnum, Datum value,
+                        IotDBColumnInfo *param_col_info,
+                        IotDBType *param_iotdb_types,
+                        IotDBValue *param_iotdb_values) {
+  Oid outputFunctionId = InvalidOid;
+  bool typeVarlena = false;
+
+  getTypeOutputInfo(type, &outputFunctionId, &typeVarlena);
+
+  switch (type) {
+  case INT2OID: {
+    int16 dat = DatumGetInt16(value);
+
+    param_iotdb_values[attnum].i = dat;
+    param_iotdb_types[attnum] = IOTDB_INT64;
+    break;
   }
+  case INT4OID: {
+    int32 dat = DatumGetInt32(value);
+
+    param_iotdb_values[attnum].i = dat;
+    param_iotdb_types[attnum] = IOTDB_INT64;
+    break;
+  }
+  case INT8OID: {
+    int64 dat = DatumGetInt64(value);
+
+    param_iotdb_values[attnum].i = dat;
+    param_iotdb_types[attnum] = IOTDB_INT64;
+    break;
+  }
+  case FLOAT4OID: {
+    float4 dat = DatumGetFloat4(value);
+
+    param_iotdb_values[attnum].d = (double)dat;
+    param_iotdb_types[attnum] = IOTDB_DOUBLE;
+    break;
+  }
+  case FLOAT8OID: {
+    float8 dat = DatumGetFloat8(value);
+
+    param_iotdb_values[attnum].d = dat;
+    param_iotdb_types[attnum] = IOTDB_DOUBLE;
+    break;
+  }
+  case NUMERICOID: {
+    Datum valueDatum;
+    valueDatum = DirectFunctionCall1(numeric_float8, value);
+    float8 dat = DatumGetFloat8(valueDatum);
+
+    param_iotdb_values[attnum].d = dat;
+    param_iotdb_types[attnum] = IOTDB_DOUBLE;
+    break;
+  }
+  case BOOLOID: {
+    bool dat = DatumGetBool(value);
+
+    param_iotdb_values[attnum].b = dat;
+    param_iotdb_types[attnum] = IOTDB_BOOLEAN;
+    break;
+  }
+
+  case TEXTOID:
+  case BPCHAROID:
+  case VARCHAROID: {
+    char *outputstring = NULL;
+    outputFunctionId = InvalidOid;
+    typeVarlena = false;
+
+    getTypeOutputInfo(type, &outputFunctionId, &typeVarlena);
+    outputstring = OidOutputFunctionCall(outputFunctionId, value);
+    param_iotdb_types[attnum] = IOTDB_STRING;
+    param_iotdb_values[attnum].s = outputstring;
+    break;
+  }
+
+  case TIMEOID:
+  case TIMESTAMPOID:
+  case TIMESTAMPTZOID: {
+    if (param_col_info[attnum].col_type == IOTDB_TIME_KEY) {
+      const int64 postgres_to_unix_epoch_usecs =
+          (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+      Timestamp valueTimeStamp = DatumGetTimestamp(value);
+      int64 valueNanoSecs =
+          (valueTimeStamp + postgres_to_unix_epoch_usecs) * 1000;
+
+      param_iotdb_values[attnum].i = valueNanoSecs;
+      param_iotdb_types[attnum] = IOTDB_TIME;
+    } else { // as string
+      char *outputstring = NULL;
+      outputFunctionId = InvalidOid;
+      typeVarlena = false;
+
+      getTypeOutputInfo(type, &outputFunctionId, &typeVarlena);
+      outputstring = OidOutputFunctionCall(outputFunctionId, value);
+      param_iotdb_types[attnum] = IOTDB_STRING;
+      param_iotdb_values[attnum].s = outputstring;
+    }
+    break;
+  }
+  default: {
+    ereport(ERROR,
+            (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+             errmsg("cannot convert constant value to InfluxDB value %u", type),
+             errhint("Constant value data type: %u", type)));
+    break;
+  }
+  }
+}
+
+char *iotdb_get_table_name(Relation rel)
+{
+    ForeignTable *table;
+    char *relname = NULL;
+    ListCell *lc;
+
+    table = GetForeignTable(RelationGetRelid(rel));
+
+    foreach(lc, table->options)
+    {
+        DefElem *def = (DefElem *)lfirst(lc);
+        if (strcmp(def->defname, "table") == 0)
+        {
+            relname = defGetString(def);
+            break;
+        }
+    }
+
+    if(relname == NULL)
+    {
+        relname = RelationGetRelationName(rel);
+    }
+
+    return relname;
+}

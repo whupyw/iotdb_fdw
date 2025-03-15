@@ -16,9 +16,11 @@
 #include "regex/regex.h"
 #include "utils/elog.h"
 #include "utils/formatting.h"
+#include <arpa/inet.h>
+
 //#include <cassert>
 //#include <cstring>
-
+int is_valid_ip(const char *ip);
 
 Datum
 iotdb_fdw_validator(PG_FUNCTION_ARGS)
@@ -71,9 +73,9 @@ iotdb_fdw_validator(PG_FUNCTION_ARGS)
             
             // regfree(&regex);
 
-            if( starts_with_http_or_https(host) == false )
+            if( is_valid_ip(host) == false )
             {
-                elog(ERROR, "invalid host format, should be http:// or https://");
+                elog(ERROR, "invalid host format, should be x.x.x.x(IPV4)");
             }
             
         }
@@ -92,6 +94,15 @@ bool iotdb_is_valid_option(const char *option, Oid context)
     }
 
     return false;
+}
+
+int is_valid_ip(const char *ip) {
+  if (ip == NULL) return 0;
+
+  int result = 0;
+      result = inet_pton(AF_INET, (char *)ip, (void *)&ip);
+  return result;
+
 }
 
 // char *str_tolower(const char *buff, size_t nbytes)
