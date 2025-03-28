@@ -2,7 +2,9 @@
 
 // #include "postgres.h"
 #include "include/iotdb_fdw.h"
+#include "access/tupdesc.h"
 #include "executor/tuptable.h"
+#include <stdbool.h>
 
 #ifndef QUERY_REST
 #include "include/query_rest.h"
@@ -101,6 +103,19 @@ static void process_query_params(ExprContext *econtext, FmgrInfo *param_flinfo,
                                  IotDBType *param_influxdb_types,
                                  IotDBValue *param_influxdb_values,
                                  IotDBColumnInfo *param_column_info);
+
+static void make_tuple_from_result_row(IotDBRow *result_row,
+                                       IotDBResult *result,
+                                       TupleDesc tupleDescriptor, Datum *row,
+                                       bool *is_null, Oid relid,
+                                       IotDBFdwExecState *festate, bool is_agg);
+
+// construct json struct from return values
+static void iotdb_get_json_string_from_result(IotDBRow *result_row,
+                                              IotDBResult *result, Oid relid,
+                                              bool is_target_tags,
+                                              bool is_target_fields,
+                                              char **tags, char **fields);
 
 Datum iotdb_fdw_version(PG_FUNCTION_ARGS);
 /*
@@ -454,9 +469,9 @@ static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
   struct IotDBQuery_return volatile ret; // pack the query result
   struct IotDBResult volatile *result;
   ForeignScan *fscan = (ForeignScan *)node->ss.ps.plan;
-  [[maybe_unused]]RangeTblEntry *rte;
+  [[maybe_unused]] RangeTblEntry *rte;
   int32 rtindex;
-  [[maybe_unused]]bool is_aggregate;
+  [[maybe_unused]] bool is_aggregate;
 
   /*
    * Identify which user to do the remote access as.  This should match what
@@ -498,6 +513,7 @@ static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
       if (ret.r1 != NULL) // ERROR occured
       {
         char *err = pstrdup(ret.r1);
+        //char *err = ret.r1;
         free(ret.r1);
         ret.r1 = err;
         ereport(ERROR, (errmsg("IotDBQuery failed: %s", ret.r1)));
@@ -529,18 +545,17 @@ static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
 
     result = (IotDBResult *)festate->temp_result;
 
-    // make_tuple_from_result_row(&(result->rows[festate->rowidx]),
-    //                            (IotDBResult *)result, tupleDescriptor,
-    //                            tupleSlot->tts_values, tupleSlot->tts_isnull,
-    //                            rte->relid, festate, is_aggregate);
-    
+    make_tuple_from_result_row(&(result->rows[festate->rowidx]),
+                               (IotDBResult *)result, tupleDescriptor,
+                               tupleSlot->tts_values, tupleSlot->tts_isnull,
+                               rte->relid, festate, is_aggregate);
+
     oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
-    //freeIotDBResultRow(festate, festate->rowidx);
+    // freeIotDBResultRow(festate, festate->rowidx);
 
-    if(festate->rowidx == (festate->row_nums - 1))
-    {
-      //freeIotDBResult(festate);
+    if (festate->rowidx == (festate->row_nums - 1)) {
+      // freeIotDBResult(festate);
     }
     MemoryContextSwitchTo(oldcontext);
     ExecStoreVirtualTuple(tupleSlot);
@@ -729,4 +744,146 @@ static void process_query_params(ExprContext *econtext, FmgrInfo *param_flinfo,
     i++;
   }
   iotdb_reset_transmisson_modes(nestlevel);
+}
+
+static void
+make_tuple_from_result_row(IotDBRow *result_row, IotDBResult *result,
+                           TupleDesc tupleDescriptor, Datum *row, bool *is_null,
+                           Oid relid, IotDBFdwExecState *festate, bool is_agg) {
+  ListCell *lc;
+  int attid = 0;
+  List *retrieved_attrs = festate->retrieved_Attrs;
+  [[maybe_unused]]ListCell *targetc;
+  char *opername = NULL;
+
+  memset(row, 0, sizeof(Datum) * tupleDescriptor->natts);
+  memset(is_null, true, sizeof(bool) * tupleDescriptor->natts);
+
+  targetc = list_head(festate->tlist);
+
+  foreach (lc, retrieved_attrs) {
+    int attnum = lfirst_int(lc) - 1;
+    Oid pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+    int32 pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
+    int result_idx = 0;
+    char *colname = NULL;
+    bool is_agg_star = false;
+    bool is_regex = false;
+    int ntags = 0;
+    int nfields = 0;
+    bool is_tags = false;
+    bool is_fields = false;
+    bool is_tagfields = false;
+    char *value = NULL;
+    char *tags_value = NULL;
+    char *fields_value = NULL;
+
+    if (is_agg) {
+      ereport(ERROR, errmsg("Not support aggregate function"));
+    } else {
+      colname = iotdb_get_column_name(relid, attnum + 1);
+      if (IOTDB_IS_TIME_COLUMN(colname)) {
+        result_idx = 0;
+      } else {
+        {
+          attid++;
+          result_idx = attid;
+        }
+        // current we don't support schemaless
+        //  if (festate->slinfo.schemaless) {
+      }
+    }
+
+    if (is_tagfields) {
+      if (!tags_value && !fields_value) {
+        ///@todo
+        iotdb_get_json_string_from_result(result_row, result, relid, is_tags,
+                                          is_fields, &tags_value,
+                                          &fields_value);
+      }
+      if (is_tags) {
+        value = tags_value;
+      } else if (is_fields) {
+        value = fields_value;
+      }
+    } else {
+      value = result_row->tuple[result_idx];
+    }
+
+    if (is_agg_star || is_regex) {
+      is_null[attnum] = true;
+      row[attnum] = iotdb_convert_record_to_datum(
+          pgtype, pgtypmod, result_row->tuple, result_idx, ntags, nfields,
+          result->colnums, opername, relid, result->ncol - result->ntag, false);
+
+    } else if (value) {
+      is_null[attnum] = false;
+      row[attnum] = iotdb_convert_to_pg(pgtype, pgtypmod, value);
+    }
+  }
+}
+
+static void iotdb_get_json_string_from_result(IotDBRow *result_row,
+                                              IotDBResult *result, Oid relid,
+                                              bool is_target_tags,
+                                              bool is_target_fields,
+                                              char **tags, char **fields) {
+  StringInfo buffer;
+  int i = 0;
+  bool is_first = true;
+  bool has_jsstr = false;
+
+  buffer = makeStringInfo();
+
+  appendStringInfoChar(buffer, '{');
+
+  for (i = 0; i < result->ncol; i++) {
+    char *escaped_key = NULL;
+    char *escaped_value = NULL;
+    bool is_tag = false;
+
+    if (IOTDB_IS_TIME_COLUMN(result->colnums[i])) {
+      continue;
+    }
+
+    is_tag = iotdb_is_tag_key(result->colnums[i], relid);
+
+    if (!(is_target_tags && is_tag) && !(is_target_fields && !is_tag)) {
+      continue;
+    }
+
+    if (!is_first) {
+      appendStringInfoChar(buffer, ',');
+    }
+
+    escaped_key = iotdb_escape_json_string(result->colnums[i]);
+    if (escaped_key == NULL)
+      elog(ERROR, "Cannot escape json column key");
+
+    escaped_value = iotdb_escape_json_string(result_row->tuple[i]);
+
+    appendStringInfo(buffer, "\"%s\" : ", escaped_key); /*key*/
+    if (escaped_value)
+      appendStringInfo(buffer, "\"%s\"", escaped_value); /*value*/
+    else
+      appendStringInfoString(buffer, "null"); /*null  */
+
+    if (escaped_key != NULL)
+      pfree(escaped_key);
+    if (escaped_value != NULL)
+      pfree(escaped_value);
+
+    has_jsstr = true;
+    is_first = false;
+  }
+
+  appendStringInfoChar(buffer, '}');
+
+  if (has_jsstr) {
+    if (is_target_tags)
+      *tags = buffer->data;
+    else
+      *fields = buffer->data;
+  }
+  return;
 }

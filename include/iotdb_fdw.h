@@ -208,7 +208,11 @@ extern void iotdb_reset_transmisson_modes(int nestlevel);
 
 // deparse.c
 char *iotdb_get_column_name(Oid relid, int attnum);
-
+extern char *iotdb_escape_json_string(char *string);
+extern Datum iotdb_convert_record_to_datum(Oid pgtyp, int pgtypmod, char **row, int attnum, int ntags, int nfield,
+  char **column, char *opername, Oid relid, int ncol, bool is_schemaless);
+extern Datum
+  iotdb_convert_to_pg(Oid pgtyp, int pgtypmod, char *value);
 extern void iotdb_deparse_select_stmt_for_rel(
     StringInfo buf, PlannerInfo *root, RelOptInfo *rel, List *tlist,
     List *remote_conds, List *pathkeys, bool is_subquery,

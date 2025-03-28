@@ -1,7 +1,6 @@
-
 #include "include/iotdb_fdw.h"
 #include "postgres.h"
-//#include "fmgr.h"
+// #include "fmgr.h"
 #include "catalog/pg_operator.h"
 #include "datatype/timestamp.h"
 #include "foreign/foreign.h"
@@ -20,6 +19,7 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "common/fe_memutils.h"
 #include "lib/stringinfo.h"
 
 #include "storage/lockdefs.h"
@@ -27,13 +27,16 @@
 #include "utils/elog.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/palloc.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 #include "access/htup.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
 
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 
 #include "commands/defrem.h"
@@ -662,13 +665,11 @@ void iotdb_deparse_var(Var *node, deparse_expr_cxt *context) {
         pindex++;
         *context->params_list = lappend(*context->params_list, node);
       }
-      ///@todo
       iotdb_print_remote_param(pindex, node->vartype, node->vartypmod, context);
 
     }
 
     else {
-      ///@todo
       iotdb_print_remote_placeholder(node->vartype, node->vartypmod, context);
     }
   }
@@ -897,28 +898,185 @@ void iotdb_bind_sql_var(Oid type, int attnum, Datum value,
   }
 }
 
-char *iotdb_get_table_name(Relation rel)
-{
-    ForeignTable *table;
-    char *relname = NULL;
-    ListCell *lc;
+char *iotdb_get_table_name(Relation rel) {
+  ForeignTable *table;
+  char *relname = NULL;
+  ListCell *lc;
 
-    table = GetForeignTable(RelationGetRelid(rel));
+  table = GetForeignTable(RelationGetRelid(rel));
 
-    foreach(lc, table->options)
+  foreach (lc, table->options) {
+    DefElem *def = (DefElem *)lfirst(lc);
+    if (strcmp(def->defname, "table") == 0) {
+      relname = defGetString(def);
+      break;
+    }
+  }
+
+  if (relname == NULL) {
+    relname = RelationGetRelationName(rel);
+  }
+
+  return relname;
+}
+
+char *iotdb_escape_json_string(char *string) {
+  StringInfo buffer;
+  const char *ptr;
+  int i;
+  int segment_start_idx;
+  int len;
+  bool needed_escaping = false;
+
+  if (string == NULL)
+    return NULL;
+
+  for (ptr = string; *ptr; ptr++) {
+    if (*ptr == '"' || *ptr == '\r' || *ptr == '\n' || *ptr == '\t' ||
+        *ptr == '\\') {
+      needed_escaping = true;
+      break;
+    }
+  }
+
+  if (!needed_escaping)
+    return pstrdup(string);
+    //return string;
+  buffer = makeStringInfo();
+  len = strlen(string);
+  segment_start_idx = 0;
+  for (i = 0; i < len; i++) {
+    if (string[i] == '"' || string[i] == '\r' || string[i] == '\n' ||
+        string[i] == '\t' || string[i] == '\\') {
+      if (segment_start_idx < i)
+        appendBinaryStringInfo(buffer, string + segment_start_idx,
+                               i - segment_start_idx);
+
+      appendStringInfoChar(buffer, '\\');
+
+      if (string[i] == '"')
+        appendStringInfoChar(buffer, '"');
+      else if (string[i] == '\r')
+        appendStringInfoString(buffer, "r");
+      else if (string[i] == '\n')
+        appendStringInfoString(buffer, "n");
+      else if (string[i] == '\t')
+        appendStringInfoString(buffer, "t");
+      else if (string[i] == '\\')
+        appendStringInfoString(buffer, "\\");
+      segment_start_idx = i + 1;
+    }
+  }
+  if (segment_start_idx < len)
+    appendBinaryStringInfo(buffer, string + segment_start_idx,
+                           len - segment_start_idx);
+  return buffer->data;
+}
+
+Datum iotdb_convert_to_pg(Oid pgtyp, int pgtypmod, char *value) {
+  Datum value_datum = 0;
+  Datum valueDatum = 0;
+  regproc typeinput;
+  HeapTuple tuple;
+  int typemod;
+
+  /* get the type's output function */
+  tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
+  if (!HeapTupleIsValid(tuple))
+    elog(ERROR, "cache lookup failed for type%u", pgtyp);
+
+  typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
+  typemod = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
+  ReleaseSysCache(tuple);
+  valueDatum = CStringGetDatum(value);
+
+  /* convert string value to appropriate type value */
+  value_datum =
+      OidFunctionCall3(typeinput, valueDatum, ObjectIdGetDatum(InvalidOid),
+                       Int32GetDatum(typemod));
+
+  return value_datum;
+}
+
+Datum iotdb_convert_record_to_datum(Oid pgtyp, int pgtypmod, char **row,
+                                    int attnum, int ntags, int nfield,
+                                    char **column, char *opername, Oid relid,
+                                    int ncol, bool is_schemaless) {
+  Datum value_datum = 0;
+  Datum valueDatum = 0;
+  regproc typeinput;
+  HeapTuple tuple;
+  int typemod;
+  int i;
+  [[maybe_unused]] StringInfoData fields_jsstr;
+  StringInfo record = makeStringInfo();
+  bool first = true;
+  [[maybe_unused]] bool is_sc_Agg_starregex = false;
+  [[maybe_unused]] bool need_enclose_brace = false;
+  char *foreignColName = NULL;
+  int nmatch = 0;
+
+  tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(pgtyp));
+  if (!HeapTupleIsValid(tuple))
+    elog(ERROR, "Cache lookup failed for type %u", pgtyp);
+
+  typeinput = ((Form_pg_type)GETSTRUCT(tuple))->typinput;
+  typemod = ((Form_pg_type)GETSTRUCT(tuple))->typtypmod;
+  ReleaseSysCache(tuple);
+
+  if (is_schemaless) {
+    elog(ERROR, "in %s schemaless is not supported", __func__);
+  }
+
+  appendStringInfo(record, "(%s, ", row[0]);
+
+  for (i = 0; i < ntags; i++)
+    appendStringInfo(record, ",");
+  i = 0;
+
+  do {
+    foreignColName = get_attname(relid, ++i, true);
+
+    if (foreignColName != NULL && !IOTDB_IS_TIME_COLUMN(foreignColName) &&
+        !iotdb_is_tag_key(foreignColName, relid))
+      ;
     {
-        DefElem *def = (DefElem *)lfirst(lc);
-        if (strcmp(def->defname, "table") == 0)
-        {
-            relname = defGetString(def);
+      bool match = false;
+      int j;
+      for (j = attnum; j < ncol; j++) {
+        char *iotdbColName = column[i];
+        ///@todo init tmpname
+        char *tmpName = foreignColName;
+
+        if (strcmp(tmpName, iotdbColName) == 0) {
+          match = true;
+          nmatch++;
+
+          if (is_schemaless) {
+            ///@todo
+          } else {
+            if (!first)
+              appendStringInfoChar(record, ',');
+            appendStringInfo(record, "%s", row[j] != NULL ? row[j] : "");
+
+            first = false;
             break;
+          }
         }
+      }
+      if (!is_schemaless && match == false)
+        appendStringInfo(record, ",");
     }
 
-    if(relname == NULL)
-    {
-        relname = RelationGetRelationName(rel);
-    }
+  } while (foreignColName != NULL);
 
-    return relname;
+  if (is_schemaless) {
+    ///@todo
+  }
+  appendStringInfo(record, ")");
+  valueDatum = CStringGetDatum(record->data);
+  value_datum =
+      OidFunctionCall3(typeinput, valueDatum, ObjectIdGetDatum(InvalidOid),
+                       Int32GetDatum(typemod));
+  return value_datum;
 }
