@@ -4,6 +4,7 @@
 #include "include/iotdb_fdw.h"
 #include "access/tupdesc.h"
 #include "executor/tuptable.h"
+#include "optimizer/restrictinfo.h"
 #include <stdbool.h>
 
 #ifndef QUERY_REST
@@ -170,6 +171,15 @@ static void iotdbGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   fpinfo->table = GetForeignTable(foreigntableid);
   fpinfo->server = GetForeignServer(fpinfo->table->serverid);
 
+  pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &fpinfo->attrs_used);
+
+  foreach(lc, fpinfo->local_conds)
+  {
+    RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+    pull_varattnos((Node *) rinfo->clause, baserel->relid, &fpinfo->attrs_used);
+  }
+  
   // Compute the selectivity and cost of the local_conds, to avoid repetitive
   // computation.
   fpinfo->local_conds_sel = clauselist_selectivity(
@@ -362,19 +372,37 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
       // default is local
       else
         local_exprs = lappend(local_exprs, rinfo->clause);
+
+      fdw_recheck_quals = remote_exprs;
     }
   } else {
     // Join relation or upper relation - set scan_relid to 0.
     // but i don't want to support such operation now
     scan_relid = 0;
 
-    ereport(ERROR,
-            (errmsg("join relation or upper relation is not supported")));
+    if (fpinfo->is_tlist_func_push_down == false) {
+      // for now, only support basic type, function
+      // push_down is also unsupported
+      Assert(!scan_clauses);
+    }
+    remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
+    local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+
+    if (fpinfo->is_tlist_func_push_down == true)
+      ereport(ERROR,
+              (errmsg("join relation or upper relation is not supported")));
+
+    else
+      fdw_scan_tlist = iotdb_build_tlist_to_deparse(baserel);
+
+    if (outer_plan) {
+      ///@todo here is grouping and aggregation
+    }
   }
 
   initStringInfo(&sql);
 
-  iotdb_deparse_select_stmt_for_rel(&sql, root, baserel, tlist, remote_exprs,
+  iotdb_deparse_select_stmt_for_rel(&sql, root, baserel, fdw_scan_tlist, remote_exprs,
                                     NULL, false, &retrieved_attrs, &params_list,
                                     has_limit);
   fpinfo->final_remote_exprs = remote_exprs;
@@ -394,9 +422,9 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
   fdw_private = list_make3(makeString(sql.data), retrieved_attrs,
                            makeInteger(for_update));
   fdw_private = lappend(fdw_private, fdw_scan_tlist);
-  // fdw_private = lappend(fdw_private,
-  // makeInteger(fpinfo->is_tlist_func_pushdown)); fdw_private =
-  // lappend(fdw_private, makeInteger(fpinfo->slinfo.schemaless));
+  fdw_private =
+      lappend(fdw_private, makeInteger(fpinfo->is_tlist_func_push_down));
+  // fdw_private = lappend(fdw_private, makeInteger(fpinfo->slinfo.schemaless));
   fdw_private = lappend(fdw_private, remote_conds);
 
   return make_foreignscan(tlist, local_exprs, scan_relid, params_list,
@@ -513,7 +541,7 @@ static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
       if (ret.r1 != NULL) // ERROR occured
       {
         char *err = pstrdup(ret.r1);
-        //char *err = ret.r1;
+        // char *err = ret.r1;
         free(ret.r1);
         ret.r1 = err;
         ereport(ERROR, (errmsg("IotDBQuery failed: %s", ret.r1)));
@@ -576,7 +604,6 @@ static void iotdb_extract_slcols(IotDBFdwRelationInfo *fpinfo,
       (tlist) ? tlist : baserel->reltarget->exprs;
   [[maybe_unused]] ListCell *lc;
 
-  // because now is not support schemaless, so here is return directly
   return;
 }
 
@@ -753,7 +780,7 @@ make_tuple_from_result_row(IotDBRow *result_row, IotDBResult *result,
   ListCell *lc;
   int attid = 0;
   List *retrieved_attrs = festate->retrieved_Attrs;
-  [[maybe_unused]]ListCell *targetc;
+  [[maybe_unused]] ListCell *targetc;
   char *opername = NULL;
 
   memset(row, 0, sizeof(Datum) * tupleDescriptor->natts);

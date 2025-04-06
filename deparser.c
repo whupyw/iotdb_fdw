@@ -1,4 +1,6 @@
 #include "include/iotdb_fdw.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/tlist.h"
 #include "postgres.h"
 // #include "fmgr.h"
 #include "catalog/pg_operator.h"
@@ -132,7 +134,7 @@ static void iotdb_deparse_column_ref(StringInfo buf, int varno, int varattno,
                                      Oid vartype, PlannerInfo *root,
                                      bool convert, bool *can_delete_directly);
 
-static char *iotdb_quote_identifier(const char *s, char q);
+// static char *iotdb_quote_identifier(const char *s, char q);
 
 static void iotdb_append_field_key(TupleDesc tupdesc, StringInfo buf,
                                    Index rtindex, PlannerInfo *root,
@@ -328,8 +330,7 @@ static void iotdb_deparse_target_list(StringInfo buf, PlannerInfo *root,
     // ignore dropped attributes
     if (attr->attisdropped)
       continue;
-
-    if (have_wholerow ||
+    if ( have_wholerow ||
         bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used)) {
       rte = planner_rt_fetch(rtindex, root);
       char *name = iotdb_get_column_name(rte->relid, i);
@@ -350,6 +351,7 @@ static void iotdb_deparse_target_list(StringInfo buf, PlannerInfo *root,
 
   if (first) {
     appendStringInfoString(buf, " * ");
+    
     return;
   }
 
@@ -423,29 +425,30 @@ static void iotdb_deparse_column_ref(StringInfo buf, int varno, int varattno,
   if (convert && vartype == BOOLOID)
     appendStringInfo(buf, "(%s=true)", colname);
   else {
+    appendStringInfoChar(buf, ' '); 
     if (IOTDB_IS_TIME_COLUMN(colname))
       appendStringInfo(buf, "time");
     else
-      appendStringInfoString(buf, iotdb_quote_identifier(colname, QUOTE));
+      appendStringInfoString(buf, colname);
   }
 }
 
 // ensure some special identifier is quoted
-static char *iotdb_quote_identifier(const char *s, char q) {
-  char *result = palloc(strlen(s) * 2 + 3);
-  char *r = result;
+// static char *iotdb_quote_identifier(const char *s, char q) {
+//   char *result = palloc(strlen(s) * 2 + 3);
+//   char *r = result;
 
-  *r++ = q;
-  while (*s) {
-    if (*s == q)
-      *r++ = *s;
-    *r++ = *s;
-    s++;
-  }
-  *r++ = q;
-  *r++ = '\0';
-  return result;
-}
+//   *r++ = q;
+//   while (*s) {
+//     if (*s == q)
+//       *r++ = *s;
+//     *r++ = *s;
+//     s++;
+//   }
+//   *r++ = q;
+//   *r++ = '\0';
+//   return result;
+// }
 
 void iotdb_append_field_key(TupleDesc tupdesc, StringInfo buf, Index rtindex,
                             PlannerInfo *root, bool first) {
@@ -941,7 +944,7 @@ char *iotdb_escape_json_string(char *string) {
 
   if (!needed_escaping)
     return pstrdup(string);
-    //return string;
+  // return string;
   buffer = makeStringInfo();
   len = strlen(string);
   segment_start_idx = 0;
@@ -1079,4 +1082,26 @@ Datum iotdb_convert_record_to_datum(Oid pgtyp, int pgtypmod, char **row,
       OidFunctionCall3(typeinput, valueDatum, ObjectIdGetDatum(InvalidOid),
                        Int32GetDatum(typemod));
   return value_datum;
+}
+
+List *iotdb_build_tlist_to_deparse(RelOptInfo *foreignrel) {
+  List *tlist = NIL;
+  IotDBFdwRelationInfo *fpinfo =
+      (IotDBFdwRelationInfo *)foreignrel->fdw_private;
+  ListCell *lc;
+
+  if (foreignrel->reloptkind == RELOPT_UPPER_REL)
+    return fpinfo->grouped_tlist;
+
+  tlist = add_to_flat_tlist(
+      tlist, pull_var_clause((Node *)foreignrel->reltarget->exprs,
+                             PVC_RECURSE_PLACEHOLDERS));
+
+  foreach (lc, fpinfo->local_conds) {
+    RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+    tlist = add_to_flat_tlist(tlist, pull_var_clause((Node *)rinfo->clause,
+                                                     PVC_RECURSE_PLACEHOLDERS));
+  }
+  return tlist;
 }

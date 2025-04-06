@@ -1,15 +1,14 @@
 
 extern "C" {
-  #include "include/iotdb_fdw.h"
-  //#include "utils/palloc.h"
-  #include "postgres.h"
- // #include "utils/elog.h"
+#include "include/iotdb_fdw.h"
+// #include "utils/palloc.h"
+#include "postgres.h"
+// #include "utils/elog.h"
 }
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
-
 
 #include "include/include/Session.h"
 #include <cstddef>
@@ -48,33 +47,29 @@ IotDBQuery(char *query, UserMapping *user, iotdb_opt *opts, IotDBType *ctypes,
 
   Session *session = new Session(opts->svr_address, opts->svr_port,
                                  opts->svr_username, opts->svr_password);
+  size_t timeColumnIndex = std::string::npos;
+
   try {
-    //   new Session("127.0.0.1", opts->svr_port, opts->svr_username,
-    //               opts->svr_password);
     session->open();
 
-    // query
+    // Execute query and get dataset
     auto sessionDataset = session->executeQueryStatement(std::string(query));
 
-    // res->r0->ncol = sessionDataset->getColumnSize();
-    //  init result->colname && ncol
+    // Get column names and initialize result structure
     std::vector<std::string> columnNames = sessionDataset->getColumnNames();
-
     res->r0->ncol = columnNames.size();
     res->r0->colnums = (char **)palloc(sizeof(char *) * res->r0->ncol);
 
     for (size_t i = 0; i < columnNames.size(); ++i) {
       const std::string &name = columnNames[i];
       res->r0->colnums[i] = pstrdup(name.c_str());
-      //res->r0->colnums[i] = const_cast<char *>(name.c_str());
     }
 
     sessionDataset->setFetchSize(1024);
     res->r0->nrow = 0;
 
-    // calculate rows
+    // Calculate rows count
     int row_cnt = 0;
-    // here need to optimize
     auto tempSessionData = session->executeQueryStatement(std::string(query));
     while (tempSessionData->hasNext()) {
       tempSessionData->next();
@@ -83,20 +78,49 @@ IotDBQuery(char *query, UserMapping *user, iotdb_opt *opts, IotDBType *ctypes,
 
     res->r0->rows = (IotDBRow *)palloc(sizeof(IotDBRow) * row_cnt);
 
-    // traversal all rows and fill in res->r0->rows
+    // 查找时间戳列
+    for (size_t i = 0; i < columnNames.size(); ++i) {
+      if (columnNames[i] == "Time") {
+        timeColumnIndex = i;
+        break;
+      }
+    }
+
+    // 处理所有行并填充 res->r0->rows
     int current_row = 0;
     while (sessionDataset->hasNext()) {
-
-      std::string rowStr = sessionDataset->next()->toString();
+      std::string rowData = sessionDataset->next()->toString();
+      std::vector<std::string> fields = splitString(rowData, '\t');
       IotDBRow &row = res->r0->rows[current_row];
-
-      std::vector<std::string> fields = splitString(rowStr, '\t');
 
       row.tuple = (char **)palloc(sizeof(char *) * res->r0->ncol);
 
-      for (int i = 0; i < res->r0->ncol; i++) {
-        row.tuple[i] = pstrdup(fields[i].c_str());
-        //row.tuple[i] = const_cast<char *>(fields[i].c_str());
+      for (size_t i = 0; i < static_cast<size_t>(res->r0->ncol);
+           i++) { // 强制转换 res->r0->ncol 到 size_t
+        if (i == timeColumnIndex &&
+            timeColumnIndex !=
+                std::string::npos) { // 使用 std::string::npos 替代 -1
+          // Convert timestamp from milliseconds to PostgreSQL TIMESTAMPTZ
+          // format
+          long long timestampMs = std::stoll(fields[i]);
+          long long seconds = timestampMs / 1000;
+          int milliseconds = timestampMs % 1000;
+
+          char timestampStr[50];
+          snprintf(timestampStr, sizeof(timestampStr), "%lld.%03d", seconds,
+                   milliseconds);
+          struct tm tmTime;
+          memset(&tmTime, 0, sizeof(tmTime));
+          strptime(timestampStr, "%s", &tmTime); // Assuming UTC time zone
+
+          char formattedTime[50];
+          strftime(formattedTime, sizeof(formattedTime), "%Y-%m-%d %H:%M:%S",
+                   &tmTime);
+
+          row.tuple[i] = pstrdup(formattedTime);
+        } else {
+          row.tuple[i] = pstrdup(fields[i].c_str());
+        }
       }
 
       current_row++;
@@ -109,4 +133,3 @@ IotDBQuery(char *query, UserMapping *user, iotdb_opt *opts, IotDBType *ctypes,
 
   return *res;
 }
-

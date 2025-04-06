@@ -229,3 +229,5 @@ extern void iotdb_bind_sql_var(Oid type, int attnum, Datum value,
                                IotDBValue *param_iotdb_values);
                     
 extern char *iotdb_get_table_name(Relation rel);
+
+extern List *iotdb_build_tlist_to_deparse(RelOptInfo *foreignrel);
