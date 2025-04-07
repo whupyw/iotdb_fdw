@@ -171,15 +171,15 @@ static void iotdbGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   fpinfo->table = GetForeignTable(foreigntableid);
   fpinfo->server = GetForeignServer(fpinfo->table->serverid);
 
-  pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &fpinfo->attrs_used);
+  pull_varattnos((Node *)baserel->reltarget->exprs, baserel->relid,
+                 &fpinfo->attrs_used);
 
-  foreach(lc, fpinfo->local_conds)
-  {
-    RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+  foreach (lc, fpinfo->local_conds) {
+    RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
 
-    pull_varattnos((Node *) rinfo->clause, baserel->relid, &fpinfo->attrs_used);
+    pull_varattnos((Node *)rinfo->clause, baserel->relid, &fpinfo->attrs_used);
   }
-  
+
   // Compute the selectivity and cost of the local_conds, to avoid repetitive
   // computation.
   fpinfo->local_conds_sel = clauselist_selectivity(
@@ -402,9 +402,9 @@ static ForeignScan *iotdbGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 
   initStringInfo(&sql);
 
-  iotdb_deparse_select_stmt_for_rel(&sql, root, baserel, fdw_scan_tlist, remote_exprs,
-                                    NULL, false, &retrieved_attrs, &params_list,
-                                    has_limit);
+  iotdb_deparse_select_stmt_for_rel(&sql, root, baserel, fdw_scan_tlist,
+                                    remote_exprs, NULL, false, &retrieved_attrs,
+                                    &params_list, has_limit);
   fpinfo->final_remote_exprs = remote_exprs;
 
   ///@todo for update
@@ -592,9 +592,22 @@ static TupleTableSlot *iotdbIterateForeignScan(ForeignScanState *node) {
   return tupleSlot;
 }
 
-static void iotdbReScanForeignScan(ForeignScanState *node) { return; }
+static void iotdbReScanForeignScan(ForeignScanState *node) {
+  IotDBFdwExecState *festate = (IotDBFdwExecState *)node->fdw_state;
 
-static void iotdbEndForeignScan(ForeignScanState *node) { return; }
+  festate->cursor_exits = false;
+  festate->rowidx = 0;
+}
+
+static void iotdbEndForeignScan(ForeignScanState *node) { 
+  IotDBFdwExecState *festate = (IotDBFdwExecState *)node->fdw_state;
+
+  if( festate != NULL)
+  {
+    festate->cursor_exits = false;
+    festate->rowidx = 0;
+  }
+}
 
 static void iotdb_extract_slcols(IotDBFdwRelationInfo *fpinfo,
                                  PlannerInfo *root, RelOptInfo *baserel,
